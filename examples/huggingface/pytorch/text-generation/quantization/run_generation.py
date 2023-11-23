@@ -1,11 +1,15 @@
 import argparse
+import os
 import re
 import time
 import json
 import torch
 import logging
 from transformers import AutoConfig, AutoTokenizer
-from intel_extension_for_transformers.transformers import AutoModelForCausalLM
+from intel_extension_for_transformers.transformers import (
+        AutoModelForCausalLM,
+        AutoModel
+)
 from transformers.utils import check_min_version
 from optimum.intel.generation.modeling import TSModelForCausalLM
 from intel_extension_for_transformers.transformers import (
@@ -13,12 +17,11 @@ from intel_extension_for_transformers.transformers import (
     WeightOnlyQuantConfig,
     SmoothQuantConfig,
     BitsAndBytesConfig
-
 )
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
-    "--model", nargs="?", default="EleutherAI/gpt-j-6B", const="EleutherAI/gpt-j-6B"
+    "--model",  default=None
 )
 parser.add_argument("--revision", default=None, type=str)
 parser.add_argument("--trust_remote_code", default=False)
@@ -36,6 +39,7 @@ parser.add_argument(
     help="by default it is int8-fp32 mixed, to enable int8 mixed amp bf16 (work on platforms like SPR)",
 )
 parser.add_argument("--peft_model_id", type=str, default=None, help="model_name_or_path of peft model")
+parser.add_argument("--quantized_model_path", type=str, default="saved_results/best_model.pt", help="the int8 model path")
 # ============Benchmark configs==============
 parser.add_argument("--benchmark", action="store_true")
 parser.add_argument("--iters", default=100, type=int, help="num iter")
@@ -72,28 +76,44 @@ args = parser.parse_args()
 
 # transformers version >= 4.32.0 contained the mpt modeling definition.
 # https://github.com/huggingface/transformers/blob/main/src/transformers/models/mpt/modeling_mpt.py
-check_min_version("4.32.0")
+# 4.31.0 for ipex.optimize_transformers
+check_min_version("4.31.0")
 
 # get model config
+if args.peft_model_id:
+    from peft import PeftConfig
+    peft_config = PeftConfig.from_pretrained(args.peft_model_id)
+    if args.model is None:
+        args.model = peft_config.base_model_name_or_path
+        print("we will use peft base_model_name_or_path to get tokenizer.")
+
 config = AutoConfig.from_pretrained(
-      args.model,
-      torchscript=True
-      if (args.sq or args.woq_algo in ['AWQ', 'TEQ'])
-      else False,  # torchscript will force `return_dict=False` to avoid jit errors
-      use_cache=True, # to use kv cache.
-      trust_remote_code=args.trust_remote_code,
-      revision=args.revision,
-      )
+    args.model,
+    torchscript=True
+    if (args.sq or args.woq_algo in ['AWQ', 'TEQ'] or (args.int8 or args.int8_bf16_mixed))
+    else False,  # torchscript will force `return_dict=False` to avoid jit errors
+    use_cache=True, # to use kv cache.
+    trust_remote_code=args.trust_remote_code,
+    revision=args.revision,
+    )
 
-
+# chatglm
+if config.model_type == "chatglm":
+    AutoModelForCausalLM = AutoModel
 # tokenizer
 if config.model_type == "llama":
-   from transformers import LlamaTokenizer
-   tokenizer = LlamaTokenizer.from_pretrained(args.model)
+    from transformers import LlamaTokenizer
+    tokenizer = LlamaTokenizer.from_pretrained(args.model)
 else:
-   tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=args.trust_remote_code)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=args.trust_remote_code)
 
-# quantization config setting
+# use peft
+args.model = args.peft_model_id if args.peft_model_id is not None else args.model
+
+# Generation
+generate_kwargs = dict(do_sample=False, temperature=0.9, num_beams=4)
+
+# mp/sq/woq/bitsandbytes config setting
 quantization_config = None
 if args.mixed_precision:
     quantization_config = MixedPrecisionConfig(dtype="bfloat16") # default is bfloat16
@@ -107,17 +127,24 @@ elif args.sq:
     elif re.search("mpt", config.model_type):
         op_type_dict = {
             "add": {"weight": {"dtype": ["fp32"]}, "activation": {"dtype": ["fp32"]}},
-            "<built-in function linear>":{"weight": {"dtype": ["fp32"]}, "activation": {"dtype": ["fp32"]}},
+            "<built-in function linear>": {"weight": {"dtype": ["fp32"]}, "activation": {"dtype": ["fp32"]}},
         }
+    elif re.search("mistral", config.model_type) or re.search("baichuan", config.model_type):
+        op_type_dict = {".*": {"activation": {"algorithm": "minmax"}}}
     else:
         op_type_dict = {}
     excluded_precisions = [] if args.int8_bf16_mixed else ["bf16"]
+    recipes = {
+                "smooth_quant": True,
+                "smooth_quant_args": {"alpha": args.alpha},
+            }
     quantization_config = SmoothQuantConfig(
-                                tokenizer=tokenizer,  # either two of one, tokenizer or calib_func
-                                alpha="auto" if args.alpha == "auto" else float(args.alpha),    # default is 0.5
-                                op_type_dict=op_type_dict,  # default is {}
-                                excluded_precisions=excluded_precisions,  # default is []
-                               )
+        tokenizer=tokenizer,  # either two of one, tokenizer or calib_func
+        recipes=recipes,
+        op_type_dict=op_type_dict,  # default is {}
+        excluded_precisions=excluded_precisions,  # default is []
+        num_beams=generate_kwargs["num_beams"],
+        )
 elif args.woq:
     quantization_config = WeightOnlyQuantConfig(compute_dtype="fp32", weight_dtype="int4_fullrange", group_size=32) #default is A32W4G32
 # bitsandbytes
@@ -136,9 +163,14 @@ if quantization_config is not None:
                                                       trust_remote_code=args.trust_remote_code,
                                                       use_llm_runtime=False
                                                       )
+    # save model
     if args.sq:
         config.save_pretrained(args.output_dir)
         user_model.save(args.output_dir)
+    elif args.mixed_precision:
+        user_model.config.save_pretrained(args.output_dir)
+        torch.save(user_model.state_dict(), os.path.join(args.output_dir, "pytorch_model.bin"))
+
 elif args.load_in_4bit or args.load_in_8bit:
     # CPU device usage is provided by intel-extension-for-transformers.
     user_model = AutoModelForCausalLM.from_pretrained(args.model,
@@ -147,22 +179,42 @@ elif args.load_in_4bit or args.load_in_8bit:
                                                       use_llm_runtime=False
                                                       )
 elif not args.int8 and not args.int8_bf16_mixed:
-    user_model = AutoModelForCausalLM.from_pretrained(args.model, config=config, trust_remote_code=args.trust_remote_code, use_llm_runtime=False)
-    # peft
     if args.peft_model_id is not None:
-        from peft import PeftModel
-        user_model = PeftModel.from_pretrained(user_model, args.peft_model_id)
-
-# Generation
-generate_kwargs = dict(do_sample=False, temperature=0.9, num_beams=4)
+        user_model = AutoModelForCausalLM.from_pretrained(args.peft_model_id, trust_remote_code=args.trust_remote_code, use_llm_runtime=False)
+    else:
+        user_model = AutoModelForCausalLM.from_pretrained(args.model, config=config, trust_remote_code=args.trust_remote_code, use_llm_runtime=False)
 
 
 if args.int8 or args.int8_bf16_mixed:
     # TorchScript model don't attribute generate method, the wrapper is provided.
     import intel_extension_for_pytorch as ipex
-    user_model = TSModelForCausalLM.from_pretrained(
-        args.output_dir, file_name="best_model.pt", trust_remote_code=args.trust_remote_code
-    )
+    if config.model_type in ["gptj", "opt", "llama", "gpt_neox"]:
+        if args.accuracy:
+            from intel_extension_for_transformers.llm.evaluation.lm_eval.models import TSModelCausalLMForOPTLLM
+            user_model = TSModelCausalLMForOPTLLM.from_pretrained(
+                args.output_dir, file_name="best_model.pt", trust_remote_code=args.trust_remote_code
+            )
+        else:
+            torch._C._jit_set_texpr_fuser_enabled(False)
+            qconfig = ipex.quantization.default_static_qconfig_mapping
+            with ipex.OnDevice(dtype=torch.float, device="meta"):
+                user_model = AutoModelForCausalLM.from_pretrained(args.model, use_llm_runtime=False)
+            user_model = ipex.optimize_transformers(
+                user_model.eval(),
+                dtype=torch.float,
+                inplace=True,
+                quantization_config=qconfig,
+                deployment_mode=False,
+            )
+            if not hasattr(user_model, "trace_graph"):
+                print("load_quantized_model")
+                self_jit = torch.jit.load(args.quantized_model_path)
+                self_jit = torch.jit.freeze(self_jit.eval())
+                ipex._set_optimized_model_for_generation(user_model, optimized_model=self_jit)            
+    else:
+        user_model = TSModelForCausalLM.from_pretrained(
+            args.output_dir, file_name="best_model.pt", trust_remote_code=args.trust_remote_code
+        )
 
 
 if args.benchmark:
@@ -202,10 +254,12 @@ if args.benchmark:
     print("Throughput: {} samples/sec".format(throughput))
 
 if args.accuracy:
+    args.model = peft_config.base_model_name_or_path if args.peft_model_id else args.model
     from intel_extension_for_transformers.llm.evaluation.lm_eval import evaluate
     results = evaluate(
         model="hf-causal",
-        model_args='pretrained='+args.model+',tokenizer='+args.model+',dtype=float32',
+        model_args='pretrained=' + args.model + ',tokenizer=' + args.model + \
+            ',dtype=float32' + ",trust_remote_code=" + str(args.trust_remote_code),
         user_model=user_model,
         batch_size=args.batch_size,
         tasks=args.tasks,
@@ -219,4 +273,3 @@ if args.accuracy:
             print("Accuracy for %s is: %s" % (task_name, results["results"][task_name]["word_perplexity"]))
         else:
             print("Accuracy for %s is: %s" % (task_name, results["results"][task_name]["acc"]))
-

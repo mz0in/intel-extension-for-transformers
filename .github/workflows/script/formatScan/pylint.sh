@@ -27,8 +27,8 @@ else
     echo "Not found requirements.txt file."
 fi
 # install packages
-pip install accelerate nlpaug nltk schema optimum-intel
 pip install git+https://github.com/EleutherAI/lm-evaluation-harness.git@83dbfbf6070324f3e5872f63e49d49ff7ef4c9b3
+pip install accelerate nlpaug nltk schema optimum-intel==1.11.0 optimum==1.13.3
 
 echo "[DEBUG] list pipdeptree..."
 pip install pipdeptree
@@ -39,7 +39,7 @@ python -m pylint -f json --disable=R,C,W,E1129 \
     --max-line-length=120 \
     --extension-pkg-whitelist=numpy,nltk \
     --ignored-classes=TensorProto,NodeProto \
-    --ignored-modules=tensorflow,torch,torch.quantization,torch.tensor,torchvision,mxnet,onnx,onnxruntime,neural_compressor,neural_compressor.benchmark,intel_extension_for_transformers.neural_engine_py \
+    --ignored-modules=tensorflow,torch,torch.quantization,torch.tensor,torchvision,mxnet,onnx,onnxruntime,neural_compressor,neural_compressor.benchmark,intel_extension_for_transformers.neural_engine_py,cv2,PIL.Image \
     --ignore-paths=/intel-extension-for-transformers/intel_extension_for_transformers/llm/runtime/graph/ \
     /intel-extension-for-transformers/intel_extension_for_transformers >${log_dir}/pylint.json
 exit_code=$?
